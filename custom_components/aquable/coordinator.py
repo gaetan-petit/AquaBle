@@ -37,12 +37,91 @@ UART_RX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # We read from this (TX o
 _NOTIFICATION_COLLECT_WINDOW = 3.5
 
 
-_BLE_LOCKS: dict[str, asyncio.Lock] = {}
+# Keep the BLE link open briefly after use so bursts of commands and the
+# follow-up status poll reuse one connection instead of reconnecting each time.
+_IDLE_DISCONNECT_SECONDS = 20.0
 
 
-def get_ble_lock(address: str) -> asyncio.Lock:
-    """Per-device lock so status polls and service commands never connect concurrently."""
-    return _BLE_LOCKS.setdefault(address.upper(), asyncio.Lock())
+class BleLink:
+    """Shared BLE connection to one device, used by status polls and service commands.
+
+    Hold ``lock`` for the whole exchange; only one connection per device is ever open.
+    """
+
+    def __init__(self, address: str) -> None:
+        self.address = address
+        self.lock = asyncio.Lock()
+        self._client: BleakClient | None = None
+        self._idle_timer: asyncio.TimerHandle | None = None
+
+    async def async_get_client(self, hass: HomeAssistant) -> BleakClient:
+        """Return a connected client, reusing the open link if there is one (lock held)."""
+        self._cancel_idle_timer()
+        if self._client and self._client.is_connected:
+            return self._client
+        ble_device = bluetooth.async_ble_device_from_address(
+            hass, self.address, connectable=True
+        )
+        if not ble_device:
+            raise BleakError(f"Device {self.address} not found or not in range")
+        self._client = await establish_connection(
+            BleakClient,
+            ble_device,
+            self.address,
+            self._on_disconnect,
+            max_attempts=3,
+            use_services_cache=True,
+        )
+        return self._client
+
+    def schedule_idle_disconnect(self, hass: HomeAssistant) -> None:
+        """Disconnect once the link has been idle for _IDLE_DISCONNECT_SECONDS."""
+        self._cancel_idle_timer()
+
+        def _fire() -> None:
+            self._idle_timer = None
+            hass.async_create_background_task(
+                self._async_idle_disconnect(), f"{DOMAIN} idle disconnect {self.address}"
+            )
+
+        self._idle_timer = hass.loop.call_later(_IDLE_DISCONNECT_SECONDS, _fire)
+
+    async def _async_idle_disconnect(self) -> None:
+        async with self.lock:
+            # Someone used the link while we waited for the lock and re-armed the timer.
+            if self._idle_timer is None:
+                await self.async_reset()
+
+    async def async_reset(self) -> None:
+        """Drop the connection (lock held, or on unload)."""
+        self._cancel_idle_timer()
+        client, self._client = self._client, None
+        if client and client.is_connected:
+            try:
+                await client.disconnect()
+            except Exception:
+                _LOGGER.debug("Error disconnecting from %s", self.address, exc_info=True)
+
+    def _cancel_idle_timer(self) -> None:
+        if self._idle_timer:
+            self._idle_timer.cancel()
+            self._idle_timer = None
+
+    def _on_disconnect(self, client: BleakClient) -> None:
+        _LOGGER.debug("%s disconnected", self.address)
+        if client is self._client:
+            self._client = None
+
+
+_BLE_LINKS: dict[str, BleLink] = {}
+
+
+def get_ble_link(address: str) -> BleLink:
+    """Return the shared BLE link for a device address."""
+    key = address.upper()
+    if key not in _BLE_LINKS:
+        _BLE_LINKS[key] = BleLink(key)
+    return _BLE_LINKS[key]
 
 
 def _process_doser_packets(packets: list[bytes]) -> DoserStatus | None:
@@ -120,11 +199,6 @@ class AquaBleCoordinator(DataUpdateCoordinator[DoserStatus | LightStatus]):
                 self.num_channels = len(set(model_info.colors.values()))
 
     async def _async_update_data(self) -> Any:
-        """Fetch data from the device, serialised with service commands."""
-        async with get_ble_lock(self.address):
-            return await self._async_fetch_data()
-
-    async def _async_fetch_data(self) -> Any:
         """Fetch data from the device via Bluetooth.
 
         Mirrors the standalone ble_client.execute_ble_commands() approach:
@@ -132,74 +206,58 @@ class AquaBleCoordinator(DataUpdateCoordinator[DoserStatus | LightStatus]):
         2. Subscribe to notifications.
         3. Send the handshake command(s).
         4. Collect ALL incoming notification packets for a fixed window.
-        5. Disconnect.
+        5. Leave the shared link open; it disconnects after a short idle period.
         6. Process the full packet list to build the merged status object.
         """
-        ble_device = bluetooth.async_ble_device_from_address(
-            self.hass, self.address, connectable=True
-        )
-        if not ble_device:
-            raise UpdateFailed(f"Could not find device {self.address}")
+        link = get_ble_link(self.address)
+        # Collect all raw packets received during the window.
+        received_packets: list[bytes] = []
 
-        client: BleakClient | None = None
-        try:
-            client = await establish_connection(
-                BleakClient,
-                ble_device,
-                self.name,
-                self._disconnected,
-                max_attempts=3,
-                use_services_cache=True,
-            )
-            if not client or not client.is_connected:
-                raise UpdateFailed("Failed to connect to device")
-
-            # Collect all raw packets received during the window.
-            received_packets: list[bytes] = []
-
-            def notification_handler(sender: Any, data: bytearray) -> None:
-                _LOGGER.debug(
-                    "%s: Notification received (%d bytes): %s",
-                    self.name,
-                    len(data),
-                    data.hex(),
-                )
-                received_packets.append(bytes(data))
-
-            await client.start_notify(UART_RX_UUID, notification_handler)
-
-            # Generate and send the status request sequence
-            if self.device_type == DEVICE_TYPE_DOSER:
-                self._msg_id, commands = generate_doser_status_sequence(self._msg_id)
-            else:
-                self._msg_id, commands = generate_handshake_sequence(self._msg_id)
-
-            for cmd in commands:
-                await client.write_gatt_char(UART_TX_UUID, cmd, response=False)
-                await asyncio.sleep(0.3)
-
-            # Wait the full collection window so all response packets arrive.
+        def notification_handler(sender: Any, data: bytearray) -> None:
             _LOGGER.debug(
-                "%s: Waiting %.1fs for notification window...",
+                "%s: Notification received (%d bytes): %s",
                 self.name,
-                _NOTIFICATION_COLLECT_WINDOW,
+                len(data),
+                data.hex(),
             )
-            await asyncio.sleep(_NOTIFICATION_COLLECT_WINDOW)
+            received_packets.append(bytes(data))
 
+        async with link.lock:
             try:
-                await client.stop_notify(UART_RX_UUID)
-            except Exception:
-                pass
+                client = await link.async_get_client(self.hass)
+                await client.start_notify(UART_RX_UUID, notification_handler)
 
-        except BleakError as err:
-            raise UpdateFailed(f"Bluetooth error: {err}") from err
-        except Exception as err:
-            if isinstance(err, UpdateFailed):
-                raise
-            raise UpdateFailed(f"Unexpected error: {err}") from err
-        finally:
-            if client and client.is_connected:
-                await client.disconnect()
+                # Generate and send the status request sequence
+                if self.device_type == DEVICE_TYPE_DOSER:
+                    self._msg_id, commands = generate_doser_status_sequence(self._msg_id)
+                else:
+                    self._msg_id, commands = generate_handshake_sequence(self._msg_id)
+
+                for cmd in commands:
+                    await client.write_gatt_char(UART_TX_UUID, cmd, response=False)
+                    await asyncio.sleep(0.3)
+
+                # Wait the full collection window so all response packets arrive.
+                _LOGGER.debug(
+                    "%s: Waiting %.1fs for notification window...",
+                    self.name,
+                    _NOTIFICATION_COLLECT_WINDOW,
+                )
+                await asyncio.sleep(_NOTIFICATION_COLLECT_WINDOW)
+
+                try:
+                    await client.stop_notify(UART_RX_UUID)
+                except Exception:
+                    pass
+
+            except BleakError as err:
+                await link.async_reset()
+                raise UpdateFailed(f"Bluetooth error: {err}") from err
+            except Exception as err:
+                await link.async_reset()
+                raise UpdateFailed(f"Unexpected error: {err}") from err
+            finally:
+                link.schedule_idle_disconnect(self.hass)
 
         _LOGGER.debug(
             "%s: Captured %d notification packet(s) from %s",

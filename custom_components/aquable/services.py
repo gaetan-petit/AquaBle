@@ -8,10 +8,7 @@ import logging
 from typing import Any
 
 import voluptuous as vol
-from bleak import BleakClient
 from bleak.exc import BleakError
-from bleak_retry_connector import establish_connection
-from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
@@ -20,7 +17,7 @@ from homeassistant.helpers import entity_registry as er
 
 from .commands import encoder, generators
 from .const import DOMAIN, DeviceModelInfo
-from .coordinator import UART_TX_UUID, AquaBleCoordinator, get_ble_lock
+from .coordinator import UART_TX_UUID, AquaBleCoordinator, get_ble_link
 from .domain.light.status import LightSchedule
 
 _LOGGER = logging.getLogger(__name__)
@@ -113,50 +110,24 @@ LIGHT_CLEAR_SCHEMA = vol.Schema(
 async def _async_execute_commands(
     hass: HomeAssistant, address: str, commands: list[bytearray]
 ) -> None:
-    """Push commands while holding the device's BLE lock (shared with status polls)."""
-    async with get_ble_lock(address):
-        await _async_write_commands(hass, address, commands)
-        # Let the controller tear the link down before the follow-up status poll reconnects.
-        await asyncio.sleep(1.0)
+    """Push commands over the device's shared BLE link (serialised with status polls)."""
+    link = get_ble_link(address)
+    async with link.lock:
+        try:
+            client = await link.async_get_client(hass)
+            _LOGGER.debug("Writing %d commands to %s", len(commands), address)
+            for i, cmd in enumerate(commands):
+                _LOGGER.debug("Writing command %d/%d: %s", i + 1, len(commands), cmd.hex())
+                await client.write_gatt_char(UART_TX_UUID, cmd, response=False)
+                await asyncio.sleep(0.1)
 
+            _LOGGER.info("Successfully pushed configuration to %s", address)
 
-async def _async_write_commands(
-    hass: HomeAssistant, address: str, commands: list[bytearray]
-) -> None:
-    """Helper to connect to a device and push a list of commands sequentially."""
-    ble_device = bluetooth.async_ble_device_from_address(hass, address, connectable=True)
-    if not ble_device:
-        raise HomeAssistantError(f"Device {address} not found or not in range.")
-
-    _LOGGER.debug("Connecting to %s to write %d commands", address, len(commands))
-
-    client: BleakClient | None = None
-    try:
-        client = await establish_connection(
-            BleakClient,
-            ble_device,
-            address,
-            max_attempts=3,
-            use_services_cache=True,
-        )
-        if not client or not client.is_connected:
-            raise HomeAssistantError(f"Failed to connect to device {address}")
-
-        for i, cmd in enumerate(commands):
-            _LOGGER.debug("Writing command %d/%d: %s", i + 1, len(commands), cmd.hex())
-            await client.write_gatt_char(UART_TX_UUID, cmd, response=False)
-            await asyncio.sleep(0.1)
-
-        # Writes are without response: give queued packets time to go out before disconnecting.
-        await asyncio.sleep(0.5)
-
-        _LOGGER.info("Successfully pushed configuration to %s", address)
-
-    except BleakError as err:
-        raise HomeAssistantError(f"Bluetooth error writing to {address}: {err}")
-    finally:
-        if client and client.is_connected:
-            await client.disconnect()
+        except BleakError as err:
+            await link.async_reset()
+            raise HomeAssistantError(f"Bluetooth error writing to {address}: {err}") from err
+        finally:
+            link.schedule_idle_disconnect(hass)
 
 
 def _get_coordinator(hass: HomeAssistant, device_id: str) -> AquaBleCoordinator:
@@ -242,7 +213,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             weekdays=call.data.get("weekdays"),
         )
         await _async_execute_commands(hass, coord.address, commands)
-        await coord.async_request_refresh()
+        hass.async_create_task(coord.async_request_refresh())
 
     async def handle_doser_manual_dose(call: ServiceCall) -> None:
         coord = _get_coordinator(hass, call.data["device_id"])
@@ -254,7 +225,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             volume_tenths_ml=volume_tenths_ml,
         )
         await _async_execute_commands(hass, coord.address, commands)
-        await coord.async_request_refresh()
+        hass.async_create_task(coord.async_request_refresh())
 
     async def handle_light_manual_mode(call: ServiceCall) -> None:
         coord = _get_coordinator(hass, call.data["device_id"])
@@ -264,7 +235,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         colors = {ch_idx: val for ch_idx, val in enumerate(channel_levels)}
         _, commands = generators.generate_light_set_brightness_sequence((0, 0), colors)
         await _async_execute_commands(hass, coord.address, commands)
-        await coord.async_request_refresh()
+        hass.async_create_task(coord.async_request_refresh())
 
     async def handle_light_auto_schedule(call: ServiceCall) -> None:
         coord = _get_coordinator(hass, call.data["device_id"])
@@ -363,7 +334,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
         commands_to_send.extend(add_cmds)
 
         await _async_execute_commands(hass, coord.address, commands_to_send)
-        await coord.async_request_refresh()
+        hass.async_create_task(coord.async_request_refresh())
 
     async def handle_light_delete_auto_schedule(call: ServiceCall) -> None:
         coord = _get_coordinator(hass, call.data["device_id"])
@@ -410,7 +381,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             )
             await _async_execute_commands(hass, coord.address, commands)
 
-        await coord.async_request_refresh()
+        hass.async_create_task(coord.async_request_refresh())
 
     async def handle_light_set_mode(call: ServiceCall) -> None:
         coord = _get_coordinator(hass, call.data["device_id"])
@@ -427,7 +398,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
             return
 
         await _async_execute_commands(hass, coord.address, commands)
-        await coord.async_request_refresh()
+        hass.async_create_task(coord.async_request_refresh())
 
     async def handle_light_clear_schedules(call: ServiceCall) -> None:
         coord = _get_coordinator(hass, call.data["device_id"])
@@ -439,7 +410,7 @@ async def async_setup_services(hass: HomeAssistant) -> None:
 
         _, commands = generators.generate_light_clear_schedules_sequence((0, 0))
         await _async_execute_commands(hass, coord.address, commands)
-        await coord.async_request_refresh()
+        hass.async_create_task(coord.async_request_refresh())
 
     # Register all services
     hass.services.async_register(
