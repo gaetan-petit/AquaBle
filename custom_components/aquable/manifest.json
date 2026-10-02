@@ -126,6 +126,14 @@
       "connectable": true
     },
     {
+      "local_name": "DYNCRGB*",
+      "connectable": true
+    },
+    {
+      "local_name": "MDTMD*",
+      "connectable": true
+    },
+    {
       "service_uuid": "6e400001-b5a3-f393-e0a9-e50e24dcca9e",
       "connectable": true
     }

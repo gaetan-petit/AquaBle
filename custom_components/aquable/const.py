@@ -64,6 +64,9 @@ DEVICE_REGISTRY: dict[str, DeviceModelInfo] = {
     "DYZSD": DeviceModelInfo("Z Light TINY", DEVICE_TYPE_LIGHT, {"white": 0, "warm_white": 1}),
     # C II RGB (3 channels)
     "DYNCRGP": DeviceModelInfo("C II RGB", DEVICE_TYPE_LIGHT, {"red": 0, "green": 1, "blue": 2}),
+    "DYNCRGB": DeviceModelInfo("C II RGB", DEVICE_TYPE_LIGHT, {"red": 0, "green": 1, "blue": 2}),
+    # Magnetic Light (2 channels)
+    "MDTMD": DeviceModelInfo("Magnetic Light", DEVICE_TYPE_LIGHT, {"red": 0, "green": 1}),
     # C II (1 channel)
     "DYNC2N": DeviceModelInfo("C II", DEVICE_TYPE_LIGHT, {"white": 0}),
     "DYNC2": DeviceModelInfo("C II", DEVICE_TYPE_LIGHT, {"white": 0}),
