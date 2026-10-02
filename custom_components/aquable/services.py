@@ -20,7 +20,7 @@ from homeassistant.helpers import entity_registry as er
 
 from .commands import encoder, generators
 from .const import DOMAIN, DeviceModelInfo
-from .coordinator import UART_TX_UUID, AquaBleCoordinator
+from .coordinator import UART_TX_UUID, AquaBleCoordinator, get_ble_lock
 from .domain.light.status import LightSchedule
 
 _LOGGER = logging.getLogger(__name__)
@@ -113,6 +113,16 @@ LIGHT_CLEAR_SCHEMA = vol.Schema(
 async def _async_execute_commands(
     hass: HomeAssistant, address: str, commands: list[bytearray]
 ) -> None:
+    """Push commands while holding the device's BLE lock (shared with status polls)."""
+    async with get_ble_lock(address):
+        await _async_write_commands(hass, address, commands)
+        # Let the controller tear the link down before the follow-up status poll reconnects.
+        await asyncio.sleep(1.0)
+
+
+async def _async_write_commands(
+    hass: HomeAssistant, address: str, commands: list[bytearray]
+) -> None:
     """Helper to connect to a device and push a list of commands sequentially."""
     ble_device = bluetooth.async_ble_device_from_address(hass, address, connectable=True)
     if not ble_device:
@@ -136,6 +146,9 @@ async def _async_execute_commands(
             _LOGGER.debug("Writing command %d/%d: %s", i + 1, len(commands), cmd.hex())
             await client.write_gatt_char(UART_TX_UUID, cmd, response=False)
             await asyncio.sleep(0.1)
+
+        # Writes are without response: give queued packets time to go out before disconnecting.
+        await asyncio.sleep(0.5)
 
         _LOGGER.info("Successfully pushed configuration to %s", address)
 

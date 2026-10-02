@@ -37,6 +37,14 @@ UART_RX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # We read from this (TX o
 _NOTIFICATION_COLLECT_WINDOW = 3.5
 
 
+_BLE_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def get_ble_lock(address: str) -> asyncio.Lock:
+    """Per-device lock so status polls and service commands never connect concurrently."""
+    return _BLE_LOCKS.setdefault(address.upper(), asyncio.Lock())
+
+
 def _process_doser_packets(packets: list[bytes]) -> DoserStatus | None:
     """Merge all doser notification packets into a single status object.
 
@@ -112,6 +120,11 @@ class AquaBleCoordinator(DataUpdateCoordinator[DoserStatus | LightStatus]):
                 self.num_channels = len(set(model_info.colors.values()))
 
     async def _async_update_data(self) -> Any:
+        """Fetch data from the device, serialised with service commands."""
+        async with get_ble_lock(self.address):
+            return await self._async_fetch_data()
+
+    async def _async_fetch_data(self) -> Any:
         """Fetch data from the device via Bluetooth.
 
         Mirrors the standalone ble_client.execute_ble_commands() approach:
