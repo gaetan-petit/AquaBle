@@ -1,9 +1,16 @@
-import { html } from "https://unpkg.com/lit-element@2.4.0/lit-element.js?module";
+import { html, svg } from "https://unpkg.com/lit-element@2.4.0/lit-element.js?module";
 import { CHANNEL_COLORS, WEEKDAYS } from "./constants.js";
 
 /**
  * Generate SVG path data for a 24-hour channel brightness ramp curve.
  */
+const CURVE_STYLES = {
+  0: { fill: "rgba(244, 67, 54, 0.15)", stroke: "#f44336", dash: "" },
+  1: { fill: "rgba(76, 175, 80, 0.15)", stroke: "#4caf50", dash: "" },
+  2: { fill: "rgba(33, 150, 243, 0.15)", stroke: "#2196f3", dash: "" },
+  3: { fill: "rgba(255, 255, 255, 0.1)", stroke: "#e0e0e0", dash: "4 2" },
+};
+
 function generateChannelPath(schedules, chIdx, width, height) {
   if (!schedules || schedules.length === 0) {
     return `M 0,${height} L ${width},${height}`;
@@ -115,10 +122,7 @@ function renderSchedulesTab(card) {
           </g>
 
           <!-- Channel Curves -->
-          <path d="${generateChannelPath(schedules, 0, 360, 110)}" fill="rgba(244, 67, 54, 0.15)" stroke="#f44336" stroke-width="2" />
-          <path d="${generateChannelPath(schedules, 1, 360, 110)}" fill="rgba(76, 175, 80, 0.15)" stroke="#4caf50" stroke-width="2" />
-          <path d="${generateChannelPath(schedules, 2, 360, 110)}" fill="rgba(33, 150, 243, 0.15)" stroke="#2196f3" stroke-width="2" />
-          <path d="${generateChannelPath(schedules, 3, 360, 110)}" fill="rgba(255, 255, 255, 0.1)" stroke="#e0e0e0" stroke-width="2" stroke-dasharray="4 2" />
+          ${card._channelIndices.map((idx) => svg`<path d="${generateChannelPath(schedules, idx, 360, 110)}" fill="${CURVE_STYLES[idx].fill}" stroke="${CURVE_STYLES[idx].stroke}" stroke-width="2" stroke-dasharray="${CURVE_STYLES[idx].dash}" />`)}
 
           <!-- Current Time Indicator -->
           <line class="time-marker-line" x1="${currentX}" y1="0" x2="${currentX}" y2="110" />
@@ -186,7 +190,7 @@ function renderSchedulesTab(card) {
                     </div>
                     <div class="channel-pills">
                       ${(sched.channels || sched.channel_brightness || []).map(
-                        (b, cIdx) => html`
+                        (b, cIdx) => !card._channelIndices.includes(cIdx) ? "" : html`
                           <div class="channel-pill ${['red', 'green', 'blue', 'white'][cIdx] || 'white'}">
                             ${CHANNEL_COLORS[cIdx] ? CHANNEL_COLORS[cIdx].name : `Ch${cIdx}`}: ${b}%
                           </div>
@@ -301,8 +305,10 @@ function renderAddTab(card) {
         <ha-icon icon="mdi:palette"></ha-icon>
         Peak Channel Levels
       </div>
-      ${['Red', 'Green', 'Blue', 'White'].map(
-        (name, idx) => html`
+      ${card._channelIndices.map(
+        (idx) => [CHANNEL_COLORS[idx].name, idx]
+      ).map(
+        ([name, idx]) => html`
           <div class="slider-row">
             <span class="slider-label" style="color: ${CHANNEL_COLORS[idx].hex}">${name}</span>
             <ha-slider
@@ -391,8 +397,10 @@ function renderManualTab(card) {
         <ha-icon icon="mdi:tune"></ha-icon>
         Instant Manual Brightness
       </div>
-      ${['Red', 'Green', 'Blue', 'White'].map(
-        (name, idx) => html`
+      ${card._channelIndices.map(
+        (idx) => [CHANNEL_COLORS[idx].name, idx]
+      ).map(
+        ([name, idx]) => html`
           <div class="slider-row">
             <span class="slider-label" style="color: ${CHANNEL_COLORS[idx].hex}">${name}</span>
             <ha-slider

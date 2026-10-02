@@ -125,6 +125,27 @@ class AquaBleLightCard extends LitElement {
     return active ? (active.attributes.device_id || active.entity_id) : "";
   }
 
+  get _channelIndices() {
+    // Channel indices this lamp supports: explicit `channels:` config, else the
+    // `<prefix>_<color>_brightness` sensors that exist, else all four.
+    const names = ["red", "green", "blue", "white"];
+    if (this._config && Array.isArray(this._config.channels)) {
+      const idx = this._config.channels
+        .map((c) => names.indexOf(String(c).toLowerCase()))
+        .filter((i) => i >= 0);
+      if (idx.length) return idx;
+    }
+    const active = this._activeSchedulesEntity;
+    if (active && this.hass) {
+      const prefix = active.entity_id.replace(/active_schedules$/, "");
+      const idx = names
+        .map((n, i) => (this.hass.states[`${prefix}${n}_brightness`] ? i : -1))
+        .filter((i) => i >= 0);
+      if (idx.length) return idx;
+    }
+    return [0, 1, 2, 3];
+  }
+
   // --- UI Event Handlers ---
 
   _setTab(tab) {
