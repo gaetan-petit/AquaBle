@@ -203,6 +203,70 @@ def _parse_schedule_blocks(body: bytes, num_channels: int) -> list[LightSchedule
     return schedules
 
 
+def _keyframe_stream_after_clock(
+    body: bytes, weekday: int | None, hour: int | None, minute: int | None
+) -> bytes | None:
+    """Return the keyframe stream if the body uses the clock-echo + keyframe layout.
+
+    Some lights (e.g. C II RGB, DYNCRGB) send a 13-byte live-output block, then
+    echo the device clock (weekday, hour, minute), then the schedule as 3-byte
+    HH MM VALUE keyframes. Returns None when that layout isn't detected.
+    """
+    if weekday is None or hour is None or minute is None:
+        return None
+    idx = body.find(bytes((weekday, hour, minute)))
+    if idx == -1 or idx > 16:
+        return None
+    return body[idx + 3 :]
+
+
+def _schedules_from_keyframes(
+    keyframes: list[LightKeyframe], num_channels: int
+) -> list[LightSchedule]:
+    """Convert a 0 -> peak -> 0 keyframe curve into sunrise/sunset/ramp schedules.
+
+    The keyframe layout carries one brightness per point and no weekday mask, so
+    the peak applies to every channel and the schedule runs every day.
+    """
+    schedules: list[LightSchedule] = []
+    segment: list[LightKeyframe] = []
+
+    def _flush() -> None:
+        if len(segment) < 2:
+            return
+        peak = max(kf.value for kf in segment)
+        if peak <= 0:
+            return
+        start, end = segment[0], segment[-1]
+        start_min = start.hour * 60 + start.minute
+        peak_kf = next(kf for kf in segment if kf.value == peak)
+        schedules.append(
+            LightSchedule(
+                sunrise_hour=start.hour,
+                sunrise_minute=start.minute,
+                sunset_hour=end.hour,
+                sunset_minute=end.minute,
+                ramp_up_minutes=(peak_kf.hour * 60 + peak_kf.minute) - start_min,
+                weekday_mask=0x7F,
+                channel_brightness=[peak] * max(num_channels, 1),
+            )
+        )
+
+    for kf in keyframes:
+        lit = any(k.value > 0 for k in segment)
+        if kf.value == 0 and not lit:
+            # Still dark: the period starts at the last 0 point before it lights up.
+            segment = [kf]
+            continue
+        segment.append(kf)
+        # A return to 0 after a non-zero point closes one on/off period.
+        if kf.value == 0:
+            _flush()
+            segment = [kf]
+    _flush()
+    return schedules
+
+
 def _parse_legacy_keyframes(body: bytes) -> tuple[list[LightKeyframe], list[tuple[int, int]]]:
     """Fall back to the original keyframe-stream parser for unknown device formats.
 
@@ -287,8 +351,19 @@ def parse_light_payload(
         keyframes: list[LightKeyframe] = []
         time_markers: list[tuple[int, int]] = []
 
-        if num_channels > 0 and len(body_bytes) >= _SCHEDULE_BLOCK_SIZE:
+        keyframe_body = (
+            _keyframe_stream_after_clock(body_bytes, weekday, hour, minute)
+            if num_channels > 0
+            else None
+        )
+        if keyframe_body is not None:
+            keyframes, time_markers = _parse_legacy_keyframes(keyframe_body)
+        if keyframe_body is not None and len(keyframes) >= 2:
+            # Clock-echo + keyframe layout (e.g. C II RGB).
+            schedules = _schedules_from_keyframes(keyframes, num_channels)
+        elif num_channels > 0 and len(body_bytes) >= _SCHEDULE_BLOCK_SIZE:
             # Primary path: parse structured schedule blocks.
+            keyframes, time_markers = [], []
             schedules = _parse_schedule_blocks(body_bytes, num_channels)
         else:
             # Legacy fallback: variable-length keyframe stream.
